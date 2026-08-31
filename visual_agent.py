@@ -18,6 +18,20 @@ log_q = queue.Queue()
 stop_ev = threading.Event()
 _busy = threading.Lock()
 
+def _eval_to(page, js, arg=None, timeout=10):
+    """统一入口 + 异常兜底。
+
+    ⚠️ 千万别把 page.evaluate 丢进线程池/其他线程：Playwright 的 sync API 跑在 greenlet 上，
+    跨线程调用会直接炸 `greenlet.error: Cannot switch to a different thread`。
+    （踩过一次，元素识别直接全废成 0 个。）
+    所以这里老老实实同步调用，只做异常兜底：导航中、上下文销毁时返回 None，
+    不让一次 evaluate 失败把整个任务带崩。
+    """
+    try:
+        return page.evaluate(js, arg)
+    except Exception:
+        return None
+
 DEFAULT_CFG = {"base": "https://apihub.agnes-ai.com/v1", "model": "agnes-2.5-flash", "key": ""}
 
 # 研究报告与截图落盘目录（运行时生成，不进分发物）
@@ -46,7 +60,7 @@ def local_key():
     return ""
 
 
-def _chat(cfg, sys_p, usr, temperature=0.3, timeout=120, retries=3):
+def _chat(cfg, sys_p, usr, temperature=0.3, timeout=45, retries=2):
     base = (cfg.get("base") or "").rstrip("/")
     model = (cfg.get("model") or "").strip()
     key = (cfg.get("key") or "").strip()
@@ -83,7 +97,18 @@ def _extract_json(txt):
     txt = txt.replace("```json", "```")
     s = txt.find("{"); e = txt.rfind("}")
     if s >= 0 and e > s:
-        return json.loads(txt[s:e+1])
+        seg = txt[s:e+1]
+        try:
+            return json.loads(seg)
+        except Exception:
+            # 模型偶尔在一段 JSON 后面又接一段废话/第二个 JSON，
+            # json.loads 会报 "Extra data" 直接把任务带崩。
+            # 用 raw_decode 只取第一段合法对象，后面的一律忽略。
+            try:
+                obj, _ = json.JSONDecoder().raw_decode(seg)
+                return obj
+            except Exception:
+                return None
     return None
 
 
@@ -182,7 +207,7 @@ def agnes_research_report(goal, notes, cfg):
 def read_page_text(page, max_chars=3500):
     """提取页面正文（去噪），用于深度研究时让模型读懂页面。"""
     try:
-        txt = page.evaluate("""() => {
+        txt = _eval_to(page, """() => {
             const root = document.querySelector('main') || document.querySelector('article') || document.body;
             let s = root ? root.innerText : document.body.innerText;
             s = (s || '').replace(/\\s+/g, ' ').trim();
@@ -257,27 +282,32 @@ def grab_elements(page):
             walk(c)
     if snap:
         walk(snap)
-    if not items:
-        try:
-            extra = page.evaluate("""() => {
-                const out=[];
-                document.querySelectorAll('button,a,input[type=text],input[type=search],textarea').forEach(el=>{
-                    const t=(el.innerText||el.value||el.placeholder||'').trim();
-                    if(t && t.length<60) out.push({role: el.tagName.toLowerCase(), name:t});
-                });
-                return out.slice(0,40);
-            }""")
-            items = extra
-        except Exception:
-            pass
-    return items[:40]
+    # 再补一轮 DOM 扫描：可访问性树经常漏掉搜索框、带 placeholder 的输入框
+    try:
+        extra = _eval_to(page, """() => {
+            const out=[];
+            document.querySelectorAll('button,a,input,textarea,select,[role=button],[role=link]').forEach(el=>{
+                const t=(el.innerText||el.value||el.placeholder||el.getAttribute('aria-label')||'').trim();
+                if(t && t.length<60) out.push({role:(el.tagName||'').toLowerCase(), name:t});
+            });
+            return out.slice(0,80);
+        }""")
+        for e in extra or []:
+            key = (e.get("role", ""), e.get("name", ""))
+            if key not in seen:
+                seen.add(key)
+                items.append({"role": e.get("role", ""), "name": e.get("name", "")})
+    except Exception:
+        pass
+    return items[:60]
 
 
 def _find_center(page, name):
-    return page.evaluate("""(nm) => {
+    return _eval_to(page, """(nm) => {
         const sel="a,button,input,textarea,select,[role=button],[role=link]";
         const els=[...document.querySelectorAll(sel)];
-        const el=els.find(e=>{const t=(e.innerText||e.value||e.placeholder||e.getAttribute('aria-label')||'').trim();return t && t.includes(nm);});
+        // 双向包含：模型说"搜索框"、页面上写"搜索"也能对上，反之亦然
+        const el=els.find(e=>{const t=(e.innerText||e.value||e.placeholder||e.getAttribute('aria-label')||'').trim();return t && (t.includes(nm)||nm.includes(t));});
         if(!el) return null;
         el.scrollIntoView({block:'center'});
         const r=el.getBoundingClientRect();
@@ -297,9 +327,10 @@ def human_click(page, el):
 
 
 def human_type(page, el, value):
-    ok = page.evaluate("""(nm) => {
+    ok = _eval_to(page, """(nm) => {
         const els=[...document.querySelectorAll('input,textarea,[contenteditable=true]')];
-        const el=els.find(e=>{const t=(e.innerText||e.value||e.placeholder||e.getAttribute('aria-label')||'').trim();return t && t.includes(nm);});
+        // 双向包含：模型说"搜索框"、页面上写"搜索"也能对上，反之亦然
+        const el=els.find(e=>{const t=(e.innerText||e.value||e.placeholder||e.getAttribute('aria-label')||'').trim();return t && (t.includes(nm)||nm.includes(t));});
         if(!el) return false;
         el.scrollIntoView({block:'center'});
         try { el.value=''; } catch(e) {}
@@ -308,8 +339,23 @@ def human_type(page, el, value):
     }""", el["name"])
     if not ok:
         return False
-    page.keyboard.type(value, delay=40)
+    # 逐字敲是给你看的（隐形手）；delay 压到 15ms，长文本也不至于敲半天
+    page.keyboard.type((value or "")[:200], delay=15)
     return True
+
+
+_last_browser = None
+
+
+def close_last_browser():
+    """关掉上一次可见模式留下的 Edge 窗口（防反复开任务堆积一堆浏览器）。"""
+    global _last_browser
+    b, _last_browser = _last_browser, None
+    if b is not None:
+        try:
+            b.close()
+        except Exception:
+            pass
 
 
 def run_agent(goal, cfg, headless, mode="quick"):
@@ -317,20 +363,43 @@ def run_agent(goal, cfg, headless, mode="quick"):
     notes = []          # 深度研究：抓取的正文笔记
     shots = []          # 深度研究：截图文件路径
     research = (mode == "research")
+    global _last_browser
+    # 看门狗：单次任务最多跑 15 分钟，到点自动收尾，别无限吊着
+    _t0 = time.time()
+
+    def _watchdog():
+        while not stop_ev.is_set():
+            if time.time() - _t0 > 900:
+                log_q.put("⏰ 已跑满 15 分钟，自动收尾（防无限卡住）")
+                stop_ev.set()
+                break
+            time.sleep(5)
+
+    threading.Thread(target=_watchdog, daemon=True).start()
     try:
         os.makedirs(SHOT_DIR, exist_ok=True)
     except Exception:
         pass
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(channel="msedge", headless=headless)
-            page = browser.new_page()
+            close_last_browser()
+            # 可见模式：窗口最大化，让你看得清它在页面上干了什么
+            launch_args = ["--start-maximized"] if not headless else []
+            browser = p.chromium.launch(channel="msedge", headless=headless, args=launch_args)
+            if not headless:
+                _last_browser = browser
+            page = browser.new_page(viewport=None if not headless else {"width": 1280, "height": 800})
             start = "https://www.bing.com"
             if "http" in goal:
                 for u in ("https://", "http://"):
                     if u in goal:
                         start = goal[goal.find(u):].split()[0]
             page.goto(start, wait_until="load", timeout=30000)
+            if not headless:
+                try:
+                    page.bring_to_front()   # 弹到最前面，别藏在别的窗口后面
+                except Exception:
+                    pass
             time.sleep(1.5)
             log_q.put(f"🌐 已打开：{page.url}")
             log_q.put(f"🤖 大脑模型：{cfg.get('model')}  ｜  模式：{'🔬 深度研究' if research else '⚡ 快速操作'}")
@@ -349,14 +418,32 @@ def run_agent(goal, cfg, headless, mode="quick"):
                     log_q.put("✅ 所有计划步骤完成。"); break
                 sub = steps[si]
                 els = grab_elements(page)
+                # 先给个"我在动"的信号，免得等模型那十几秒看着像死了
+                log_q.put(f"💭 第{step}步思考中…（当前页识别到 {len(els)} 个可点元素）")
                 try:
                     dec = agnes_decide(sub, els, history, cfg, research)
                 except Exception as e:
-                    log_q.put(f"⚠️ 决策出错：{e}"); break
+                    # 一次决策出错不该把整个任务带走：跳过这一步，继续后面的
+                    log_q.put(f"⚠️ 决策出错：{e}")
+                    si += 1
+                    if si >= len(steps):
+                        break
+                    continue
                 act = dec.get("action", "done")
                 thought = dec.get("thought", "")
                 log_q.put(f"🧠 第{step}步（计划{si+1}/{len(steps)}：{sub}）：{thought}")
                 if act == "done":
+                    # 关键兜底：计划还有后续步骤时，模型十有八九是把"当前这一小步做完了"
+                    # 误报成 done。这里降级成"这步完成、继续下一步"，绝不让它提前收工。
+                    if si < len(steps) - 1:
+                        si += 1
+                        if research:
+                            _maybe_capture(page, notes, shots, lambda: shots.__len__(), lambda n: shots.append(n))
+                        nxt = steps[si] if si < len(steps) else "（无更多）"
+                        log_q.put(f"✓ 这步干完了（计划还有后续，继续）：{nxt}")
+                        stuck = 0
+                        time.sleep(0.8)
+                        continue
                     log_q.put("✅ Agent 判断全部完成。"); break
                 elif act == "subdone":
                     si += 1
@@ -366,7 +453,7 @@ def run_agent(goal, cfg, headless, mode="quick"):
                     nxt = steps[si] if si < len(steps) else "（无更多）"
                     log_q.put(f"✓ 子任务完成，进入下一步：{nxt}")
                     stuck = 0
-                    time.sleep(1)
+                    time.sleep(0.8)
                     continue
                 elif act == "click":
                     idx = int(dec.get("idx", 0)) - 1
@@ -378,10 +465,12 @@ def run_agent(goal, cfg, headless, mode="quick"):
                         log_q.put("⚠️ 编号越界，跳过")
                 elif act == "type":
                     idx = int(dec.get("idx", 0)) - 1
-                    val = dec.get("value", "")
+                    # 模型偶尔会把一整段文字塞进 value，逐字敲会敲到天荒地老，截断
+                    val = (dec.get("value", "") or "").strip()[:200]
                     if 0 <= idx < len(els):
+                        log_q.put(f"⌨️ 准备在 [{els[idx]['name'][:24]}] 输入 {len(val)} 字…")
                         ok = human_type(page, els[idx], val)
-                        log_q.put(f"⌨️ 在 [{els[idx]['name']}] 输入：{val} -> {'成功' if ok else '失败'}")
+                        log_q.put(f"⌨️ 输入完成「{val[:50]}」-> {'成功' if ok else '失败'}")
                         history.append(f"在 {els[idx]['name']} 输入 {val}")
                     else:
                         log_q.put("⚠️ 编号越界，跳过")
@@ -401,20 +490,23 @@ def run_agent(goal, cfg, headless, mode="quick"):
                     log_q.put("📜 滚动页面"); history.append("滚动")
                 else:
                     log_q.put("✅ 结束"); break
-                sig = page.url + "|" + str(len(history))
+                # 卡死检测用"动作指纹"：同一个动作 + 同一个值反复来，就是在原地打转
+                # （旧版只看 url+history 长度，模型重复输入同样的字会被判成"有进展"，傻打五六次）
+                sig = (f"{act}|{str(dec.get('value') or '')[:30]}"
+                       f"|{str(dec.get('idx') or '')}|{page.url}")
                 if sig == last_sig:
                     stuck += 1
                 else:
                     stuck = 0
                     last_sig = sig
-                if stuck >= 4:
-                    log_q.put("⏭ 连续无进展，跳过当前子任务")
+                if stuck >= 3:
+                    log_q.put("⏭ 同一个动作反复执行，判定卡住，跳过当前子任务")
                     si += 1
                     stuck = 0
                 # 深度研究：每完成一个动作也尝试抓一次（去重 by url），并偶尔截图
                 if research:
                     _maybe_capture(page, notes, shots, lambda: shots.__len__(), lambda n: shots.append(n))
-                time.sleep(1.2)
+                time.sleep(0.6)
             final_url = page.url
             try:
                 final_title = page.title()
