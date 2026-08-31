@@ -44,6 +44,10 @@ HTML = r"""<!doctype html><html lang="zh"><head><meta charset="utf-8">
   button.go:active{transform:translateY(1px)}
   button.ghost{background:#eef1f5;color:#3a3f46;font-weight:600;border:0;border-radius:10px;padding:10px 14px;font-size:13px;cursor:pointer;transition:.15s}
   button.ghost:hover{background:#e3e7ec}
+  .vis{margin-left:auto;display:flex;align-items:center;gap:6px;font-size:12.5px;font-weight:600;color:#5a6068;cursor:pointer;user-select:none;white-space:nowrap}
+  .vis input{width:15px;height:15px;accent-color:#2f6df6;cursor:pointer}
+  .vishint{font-size:11.5px;color:#8a9098;line-height:1.5;margin-top:8px}
+  .vishint.off{color:#b08a2a}
   .result{flex:1;min-height:160px;display:flex;flex-direction:column;gap:8px}
   .tabs{display:flex;gap:6px}
   .tab{border:1px solid #e3e6ea;background:#fff;color:#6a7078;border-radius:9px;padding:6px 14px;font-size:12.5px;font-weight:600;cursor:pointer}
@@ -129,7 +133,9 @@ HTML = r"""<!doctype html><html lang="zh"><head><meta charset="utf-8">
   <div class="actions">
     <button class="go" onclick="start()">🔍 开始</button>
     <button class="ghost" onclick="stop()">⏹ 停止</button>
+    <label class="vis"><input type="checkbox" id="vis" checked onchange="saveVis()"> 看得见浏览器</label>
   </div>
+  <div class="vishint" id="vishint">✓ 会弹出真实 Edge 窗口，你能亲眼看到鼠标自己移动、点击、打字（隐形手）。不想让它弹窗口就取消勾选，改后台静默跑。</div>
 </div>
 
 <div class="result">
@@ -212,7 +218,7 @@ function start(){
   document.getElementById('log').textContent='';
   document.getElementById('report').innerHTML='<div class="placeholder">任务进行中…报告会在干完后出现在这里。</div>';
   setState('running');
-  fetch('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({goal:g,mode:MODE,cfg:cfg})});
+  fetch('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({goal:g,mode:MODE,cfg:cfg,visible:document.getElementById('vis').checked})});
   if(window._es) try{window._es.close();}catch(e){}
   window._es=new EventSource('/api/stream');
   window._es.onmessage=function(ev){
@@ -225,6 +231,12 @@ function start(){
   window._es.onerror=function(){ /* 连接断开会自动重连，忽略 */ };
 }
 function stop(){ fetch('/api/stop',{method:'POST'}); }
+function saveVis(){
+  var c=document.getElementById('vis').checked, h=document.getElementById('vishint');
+  store.vis=c; saveStore();
+  if(c){ h.className='vishint'; h.textContent='✓ 会弹出真实 Edge 窗口，你能亲眼看到鼠标自己移动、点击、打字（隐形手）。不想让它弹窗口就取消勾选，改后台静默跑。'; }
+  else { h.className='vishint off'; h.textContent='⚠ 后台静默运行：屏幕上不会弹浏览器窗口，只在下面的日志里看它干了什么。'; }
+}
 async function fillLocalKey(){
   try{
     var p=document.getElementById('prov').value;
@@ -236,9 +248,11 @@ async function fillLocalKey(){
 }
 window.onload=function(){
   document.getElementById('prov').value=store.prov||'agnes';
+  document.getElementById('vis').checked=(store.vis!==false);
   provChange();
   setMode('quick');
   setTab('log');
+  saveVis();
   fillLocalKey();
 };
 </script></body></html>"""
@@ -275,6 +289,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/start":
             goal = (data.get("goal") or "").strip()
             mode = data.get("mode") or "quick"
+            # visible=True -> 真实 Edge 窗口弹出，能亲眼看见鼠标自己移动点击（隐形手）
+            # visible=False -> 后台无头跑，屏幕上不弹窗口
+            headless = (data.get("visible") is not True)
             cfg = {**va.DEFAULT_CFG, **{k: v for k, v in (data.get("cfg") or {}).items() if v}}
             va.stop_ev.clear()
             if va._busy.locked():
@@ -285,10 +302,24 @@ class Handler(BaseHTTPRequestHandler):
                 va.log_q.put("⚠️ 没收到目标")
                 self._send(200, '{"ok":false}')
                 return
-            threading.Thread(target=lambda: va.run_agent(goal, cfg, True, mode), daemon=True).start()
+
+            def runner():
+                # 用 _busy 锁防并发；finally 保证一定回到 idle，
+                # 否则前端状态永远卡在「搜索中」，看着就像死了没干活。
+                with va._busy:
+                    try:
+                        va.log_q.put("STATE::running")
+                        va.run_agent(goal, cfg, headless, mode)
+                    except Exception as e:
+                        va.log_q.put(f"❌ 运行出错：{e}")
+                    finally:
+                        va.log_q.put("STATE::idle")
+
+            threading.Thread(target=runner, daemon=True).start()
             self._send(200, '{"ok":true}')
         elif self.path == "/api/stop":
             va.stop_ev.set()
+            va.close_last_browser()
             self._send(200, '{"ok":true}')
         else:
             self._send(404, "not found")
