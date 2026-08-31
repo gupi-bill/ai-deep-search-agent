@@ -23,6 +23,14 @@ python visual_agent.py
 ```
 可选参数：加 `--headless` 无界面运行。
 
+## 本地服务模式（推荐 · 浏览器打开即用）
+不依赖原生窗口、不依赖 PyInstaller：起一个本地 HTTP 服务，浏览器访问即可。
+```bash
+python server.py
+# 打开 http://localhost:8080
+```
+UI、快速操作、深度研究、带来源报告全部可用；Agent 在后端无头驱动真实 Edge，日志/报告通过 SSE 实时推到前端。
+
 ## 打包成 exe（可选）
 ```bash
 pip install pyinstaller
