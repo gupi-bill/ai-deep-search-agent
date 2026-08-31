@@ -1,0 +1,6 @@
+# 运行依赖
+playwright>=1.40
+pywebview>=5.0
+requests>=2.31
+
+# 打包（可选）：pip install pyinstaller
