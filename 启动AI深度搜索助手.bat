@@ -1,14 +1,12 @@
 @echo off
 chcp 65001 >nul
 cd /d "C:\Users\a\Desktop\vibe coding"
-title AI 深度搜索助手 - 本地服务
+title AI 深度搜索助手
 echo.
-echo   正在启动本地服务...
-echo   浏览器会自动打开： http://localhost:8080
+echo   正在启动程序...（第一次可能要等几秒）
 echo.
-echo   用完直接关掉这个黑窗口，服务就停了。
-echo   （勾上「看得见浏览器」，你能亲眼看到鼠标自己移动、点击、打字）
+echo   程序窗口会自己弹出来。
+echo   这个黑窗口是它的后台，别关，关了程序就退了。
 echo.
-start "" /min cmd /c "timeout /t 4 >nul && explorer http://localhost:8080"
-"C:\Users\a\.workbuddy\binaries\python\envs\default\Scripts\python.exe" server.py
+"C:\Users\a\.workbuddy\binaries\python\envs\default\Scripts\python.exe" visual_agent.py
 pause
