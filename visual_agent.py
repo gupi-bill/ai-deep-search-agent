@@ -1,10 +1,14 @@
 #!/usr/bin/env python
 # 可视化 Agent —— 真能看见它干活的浏览器 Agent。
 # 说人话给它目标，它打开真实 Edge 浏览器，像隐形的人一样移动鼠标、点击、输入，
-# 一步步完成；干完用一句人话告诉你结果。
+# 一步步完成；干完用一段话汇报。
+# 两种模式：
+#   ⚡ 快速操作 —— 去某个网页点、打字、发送（控制任意本地/外网页面）
+#   🔬 深度研究 —— 跨多个网页读资料、抓正文，最后给你一份带来源引用的研究报告
 # 多厂商模型适配器：不内置任何 key，用户自己选厂商、填自己的 key（本机记住）。
-# 支持任意 OpenAI 兼容端点。打包后双击即用。
-import os, json, re, sys, time, threading, queue
+# 支持任意 OpenAI 兼容端点；推理模型（deepseek-reasoner 等）可直接当大脑。
+# 打包后双击即用。
+import os, json, re, sys, time, threading, queue, html, datetime
 import webview
 import requests
 from playwright.sync_api import sync_playwright
@@ -15,6 +19,10 @@ stop_ev = threading.Event()
 _busy = threading.Lock()
 
 DEFAULT_CFG = {"base": "https://apihub.agnes-ai.com/v1", "model": "agnes-2.5-flash", "key": ""}
+
+# 研究报告与截图落盘目录（运行时生成，不进分发物）
+REPORT_DIR = os.path.join(os.path.expanduser("~"), "Documents", "AI深度搜索助手_报告")
+SHOT_DIR = os.path.join(REPORT_DIR, "shots")
 
 
 def local_key():
@@ -79,9 +87,16 @@ def _extract_json(txt):
     return None
 
 
-def plan_task(goal, cfg):
+def plan_task(goal, cfg, research):
+    mode_note = ("你正在规划一次『深度研究』：Agent 会跨多个网页查资料并抓取正文，最后汇总成报告。"
+                 "请把意图拆成 4-8 个步骤，尽量覆盖多个信息来源（不同站点/不同文章），"
+                 "并包含『进入某篇具体内容页』的步骤以便抓正文。")
+    if not research:
+        mode_note = ("你正在规划一次『快速操作』：Agent 去某个网页点按、打字、发送即可，步骤 2-5 个。"
+                     "无需进入深读页面，达成动作即止。")
     sys_p = ("你是任务规划器。用户会用口语、零散、省略主语、甚至跳跃的方式，描述想让浏览器Agent帮它做的事。"
-             "请把意图拆成 2-6 个明确的浏览器操作步骤（中文），并补全常识与默认站点："
+             + mode_note +
+             "请把意图拆成明确的浏览器操作步骤（中文），并补全常识与默认站点："
              "『知乎』→打开 zhihu.com；『B站/哔哩哔哩』→打开 bilibili.com；『必应』→打开 bing.com；"
              "『百度』→打开 baidu.com；『微博』→打开 weibo.com；『淘宝』→打开 taobao.com；『谷歌』→打开 google.com；"
              "『搜/查/找 X』→在搜索框输入X并回车；『点开第一个结果/第一篇/第一个视频』→点击结果列表第一项；"
@@ -103,12 +118,17 @@ def plan_task(goal, cfg):
     return [goal]
 
 
-def agnes_decide(goal, elements, history, cfg):
+def agnes_decide(goal, elements, history, cfg, research):
     elist = "\n".join(f"{i+1}. [{e['role']}] {e['name']}" for i, e in enumerate(elements)) or "（无）"
     hist = "\n".join(history[-8:]) or "（还没开始）"
+    extra = ""
+    if research:
+        extra = ("这是『深度研究』模式：进入一篇具体内容/文章页后，请优先返回 action=subdone 让系统抓正文；"
+                 "不要反复在同一页空操作。多个来源都看过后，最后返回 action=done。")
     sys_p = ("你是浏览器操作 Agent。用户想完成一个明确的『子任务』。请结合当前页面『可交互元素列表』决定下一步动作。"
              "注意：用户的原话可能口语化、省略主语、跳跃，请自行补全意图（例如『点开第一个』=点击结果列表第一项；"
              "『搜X』=在搜索框输入X回车；『进去看看』=点击进入该链接）。"
+             + extra +
              "只返回一段 JSON，不要解释：{\"action\":\"click|type|enter|goto|scroll|subdone|done\","
              "\"idx\":元素编号(click/type用),\"value\":\"输入内容(type用)或按键名(enter用,默认Enter)\",\"url\":\"网址(goto用)\","
              "\"thought\":\"一句话说明这步要干什么\"}。"
@@ -136,6 +156,83 @@ def agnes_final_answer(goal, history, final_url, final_title, cfg):
         return txt.strip() or "活干完了，看上面步骤。"
     except Exception:
         return "活干完了（总结没拿到，看上面步骤日志）。"
+
+
+def agnes_research_report(goal, notes, cfg):
+    """基于抓取的多页笔记，写一份带来源引用的研究报告（Markdown）。"""
+    if not notes:
+        return "# 研究报告\n\n（没抓到任何页面正文，可能网站反爬或需要登录。换种说法再试，或切到『快速操作』。）"
+    sys_p = ("你是一个研究助理。用户提出一个问题，你的浏览器 Agent 已经去多个网页查资料并抓取了正文片段。"
+             "请综合这些资料，用中文写一份简洁的研究报告，结构如下（严格用 Markdown）：\n"
+             "# 一句话结论\n"
+             "用一两句话直接回答用户的问题。\n\n"
+             "## 关键要点\n"
+             "用 - 列出 3-6 条要点，每条带一句依据。\n\n"
+             "## 信息来源\n"
+             "逐条列出每个来源：`- [来源标题](链接) — 一句话说明它提供了什么`。\n\n"
+             "口语、自然、像真人整理。不要编造资料里没有的信息；资料不足就明说。只输出 Markdown，不要解释。")
+    notes_txt = "\n\n".join(f"【来源 {i+1}】{n['title']}\n{n['url']}\n{n['text']}" for i, n in enumerate(notes))
+    usr = f"用户的问题：{goal}\n\n抓取到的资料：\n{notes_txt}\n\n研究报告（Markdown）："
+    try:
+        return _chat(cfg, sys_p, usr, temperature=0.4, timeout=180)
+    except Exception as e:
+        return f"# 研究报告\n\n（报告生成失败：{e}）\n\n## 抓到的原始资料\n" + notes_txt[:2000]
+
+
+def read_page_text(page, max_chars=3500):
+    """提取页面正文（去噪），用于深度研究时让模型读懂页面。"""
+    try:
+        txt = page.evaluate("""() => {
+            const root = document.querySelector('main') || document.querySelector('article') || document.body;
+            let s = root ? root.innerText : document.body.innerText;
+            s = (s || '').replace(/\\s+/g, ' ').trim();
+            return s.slice(0, 7000);
+        }""")
+        return (txt or "").strip()[:max_chars]
+    except Exception:
+        return ""
+
+
+def _md_to_html(md):
+    """极简 Markdown -> HTML（标题/列表/链接/段落），用于报告面板展示。"""
+    out = []
+    in_list = False
+    for line in md.splitlines():
+        s = line.rstrip()
+        if not s.strip():
+            if in_list:
+                out.append("</ul>"); in_list = False
+            continue
+        if s.startswith("### "):
+            if in_list: out.append("</ul>"); in_list = False
+            out.append(f"<h4>{_esc(s[4:])}</h4>")
+        elif s.startswith("## "):
+            if in_list: out.append("</ul>"); in_list = False
+            out.append(f"<h3>{_esc(s[3:])}</h3>")
+        elif s.startswith("# "):
+            if in_list: out.append("</ul>"); in_list = False
+            out.append(f"<h2>{_esc(s[2:])}</h2>")
+        elif s.startswith("- "):
+            if not in_list:
+                out.append("<ul>"); in_list = True
+            out.append(f"<li>{_inline(s[2:])}</li>")
+        else:
+            if in_list: out.append("</ul>"); in_list = False
+            out.append(f"<p>{_inline(s)}</p>")
+    if in_list:
+        out.append("</ul>")
+    return "\n".join(out)
+
+
+def _esc(t):
+    return html.escape(t)
+
+
+def _inline(t):
+    # 链接 [text](url)
+    t = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)",
+               lambda m: f'<a href="{m.group(2)}" target="_blank" rel="noopener">{_esc(m.group(1))}</a>', t)
+    return _esc(t)
 
 
 def grab_elements(page):
@@ -215,8 +312,15 @@ def human_type(page, el, value):
     return True
 
 
-def run_agent(goal, cfg, headless):
+def run_agent(goal, cfg, headless, mode="quick"):
     history = []
+    notes = []          # 深度研究：抓取的正文笔记
+    shots = []          # 深度研究：截图文件路径
+    research = (mode == "research")
+    try:
+        os.makedirs(SHOT_DIR, exist_ok=True)
+    except Exception:
+        pass
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(channel="msedge", headless=headless)
@@ -229,14 +333,16 @@ def run_agent(goal, cfg, headless):
             page.goto(start, wait_until="load", timeout=30000)
             time.sleep(1.5)
             log_q.put(f"🌐 已打开：{page.url}")
-            log_q.put(f"🤖 大脑模型：{cfg.get('model')}")
+            log_q.put(f"🤖 大脑模型：{cfg.get('model')}  ｜  模式：{'🔬 深度研究' if research else '⚡ 快速操作'}")
             log_q.put("🧠 正在把你的话翻译成执行计划…")
-            steps = plan_task(goal, cfg)
+            steps = plan_task(goal, cfg, research)
             log_q.put("📋 计划 " + str(len(steps)) + " 步：" + " ｜ ".join(steps))
             si = 0
             stuck = 0
             last_sig = ""
-            for step in range(1, 40):
+            shot_n = 0
+            last_note_url = ""
+            for step in range(1, 50):
                 if stop_ev.is_set():
                     log_q.put("⏹ 已停止"); break
                 if si >= len(steps):
@@ -244,7 +350,7 @@ def run_agent(goal, cfg, headless):
                 sub = steps[si]
                 els = grab_elements(page)
                 try:
-                    dec = agnes_decide(sub, els, history, cfg)
+                    dec = agnes_decide(sub, els, history, cfg, research)
                 except Exception as e:
                     log_q.put(f"⚠️ 决策出错：{e}"); break
                 act = dec.get("action", "done")
@@ -254,6 +360,9 @@ def run_agent(goal, cfg, headless):
                     log_q.put("✅ Agent 判断全部完成。"); break
                 elif act == "subdone":
                     si += 1
+                    # 深度研究：到达一个内容页就抓正文
+                    if research:
+                        _maybe_capture(page, notes, shots, lambda: shots.__len__(), lambda n: shots.append(n))
                     nxt = steps[si] if si < len(steps) else "（无更多）"
                     log_q.put(f"✓ 子任务完成，进入下一步：{nxt}")
                     stuck = 0
@@ -302,6 +411,9 @@ def run_agent(goal, cfg, headless):
                     log_q.put("⏭ 连续无进展，跳过当前子任务")
                     si += 1
                     stuck = 0
+                # 深度研究：每完成一个动作也尝试抓一次（去重 by url），并偶尔截图
+                if research:
+                    _maybe_capture(page, notes, shots, lambda: shots.__len__(), lambda n: shots.append(n))
                 time.sleep(1.2)
             final_url = page.url
             try:
@@ -309,12 +421,70 @@ def run_agent(goal, cfg, headless):
             except Exception:
                 final_title = ""
             log_q.put("🏁 干活结束，整理结果…")
-            ans = agnes_final_answer(goal, history, final_url, final_title, cfg)
-            log_q.put("ANSWER::" + ans)
+            if research:
+                # 收尾再抓一次
+                _maybe_capture(page, notes, shots, lambda: shots.__len__(), lambda n: shots.append(n))
+                report_md = agnes_research_report(goal, notes, cfg)
+                path = _save_report(goal, report_md, shots)
+                report_html = _md_to_html(report_md)
+                src_html = "".join(
+                    f'<div class="src"><span class="dot"></span><a href="{html.escape(n["url"])}" target="_blank" rel="noopener">{html.escape(n["title"] or n["url"])}</a></div>'
+                    for n in notes)
+                full = (f'<div class="rep-head">共读取 {len(notes)} 个来源 · 截图 {len(shots)} 张</div>'
+                        f'<div class="sources">{src_html}</div><div class="rep-body">{report_html}</div>')
+                log_q.put("REPORT::" + full)
+                if path:
+                    log_q.put(f"💾 报告已保存：{path}")
+                    log_q.put("OPENPATH::" + path)
+            else:
+                ans = agnes_final_answer(goal, history, final_url, final_title, cfg)
+                log_q.put("ANSWER::" + ans)
             if headless:
                 browser.close()
     except Exception as e:
         log_q.put(f"❌ 运行出错：{e}")
+
+
+def _maybe_capture(page, notes, shots, shot_len_fn, shot_add_fn):
+    """深度研究：把当前页正文抓进 notes（按 url 去重）；每抓几页截一张图。"""
+    try:
+        url = page.url
+        if url and url not in [n["url"] for n in notes]:
+            txt = read_page_text(page)
+            if txt and len(txt) > 120:
+                title = ""
+                try:
+                    title = page.title()
+                except Exception:
+                    pass
+                notes.append({"url": url, "title": title, "text": txt})
+                log_q.put(f"📄 已抓取正文：{title or url}（{len(txt)} 字）")
+                # 截图（最多 6 张）
+                if shot_len_fn() < 6:
+                    ts = datetime.datetime.now().strftime("%H%M%S")
+                    sp = os.path.join(SHOT_DIR, f"shot_{ts}_{len(notes)}.png")
+                    try:
+                        page.screenshot(path=sp, full_page=False)
+                        shot_add_fn(sp)
+                        log_q.put(f"🖼 截图已存：{os.path.basename(sp)}")
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+
+def _save_report(goal, md, shots):
+    try:
+        os.makedirs(REPORT_DIR, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(REPORT_DIR, f"research_{ts}.md")
+        shots_rel = "\n".join(f"![]({os.path.abspath(s)})\n" for s in shots)
+        header = f"# 深度研究｜{goal}\n\n> 生成时间：{ts}  ｜  截图 {len(shots)} 张\n\n"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(header + md + "\n\n---\n\n## 截图\n\n" + shots_rel)
+        return path
+    except Exception:
+        return ""
 
 
 # ---------------- 原生窗口 UI（pywebview） ----------------
@@ -322,39 +492,78 @@ HTML = r"""<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <style>
   *{box-sizing:border-box;margin:0}
   html,body{height:100%}
-  body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#f6f7f9;color:#1c1f24}
-  .wrap{height:100%;display:flex;flex-direction:column;padding:18px 18px 14px;gap:12px}
-  .top{display:flex;align-items:center;justify-content:space-between}
-  .top h1{font-size:17px;font-weight:700;letter-spacing:.2px}
-  .top h1 em{font-style:normal;color:#2f6df6}
-  .badge{font-size:12px;padding:4px 11px;border-radius:99px;background:#eef1f5;color:#7a8088;font-weight:600}
-  .badge.run{background:#e8f6ec;color:#1e9e50}
-  .badge.run i{display:inline-block;width:7px;height:7px;border-radius:50%;background:#22b45e;margin-right:6px;animation:pulse 1.2s infinite}
+  body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#f3f4f6;color:#1c1f24;font-size:14px}
+  .wrap{height:100%;display:flex;flex-direction:column;padding:16px;gap:12px}
+  /* 顶栏 */
+  .top{display:flex;align-items:center;justify-content:space-between;padding:2px 2px 0}
+  .brand{font-size:16px;font-weight:750;letter-spacing:.2px;display:flex;align-items:baseline;gap:8px}
+  .brand em{font-style:normal;font-size:12px;font-weight:500;color:#8a9098}
+  .status{font-size:12px;padding:4px 12px;border-radius:99px;background:#eef1f5;color:#7a8088;font-weight:600;display:flex;align-items:center;gap:6px}
+  .status i{width:7px;height:7px;border-radius:50%;background:#b6bcc4;display:inline-block}
+  .status.run{background:#e9f6ee;color:#1e9e50}
+  .status.run i{background:#22b45e;animation:pulse 1.2s infinite}
   @keyframes pulse{0%{opacity:1}50%{opacity:.3}100%{opacity:1}}
-  .sub{font-size:12px;color:#8a9098;line-height:1.5;margin-top:-4px}
-  .card{background:#fff;border:1px solid #e8eaee;border-radius:14px;padding:14px;box-shadow:0 1px 2px rgba(16,24,40,.04)}
-  .row{display:flex;gap:8px;margin-top:10px;align-items:center}
-  .row:first-child{margin-top:0}
-  select,.inp{border:1px solid #dfe3e8;border-radius:10px;padding:9px 10px;font-size:13px;background:#fbfcfd;color:#333;outline:none;transition:border .15s,box-shadow .15s;min-width:0}
+  /* 模式切换 */
+  .modes{display:flex;gap:8px}
+  .mode{flex:1;border:1px solid #e3e6ea;background:#fff;color:#5a6068;border-radius:11px;padding:10px;font-size:13px;font-weight:600;cursor:pointer;transition:.15s;display:flex;flex-direction:column;gap:2px;align-items:flex-start}
+  .mode small{font-weight:400;font-size:11px;color:#9aa0a8;line-height:1.4}
+  .mode.active{border-color:#2f6df6;background:#f5f8ff;color:#1f4fc0;box-shadow:0 1px 2px rgba(47,109,246,.06)}
+  .mode.active small{color:#7d94c8}
+  /* 卡片 */
+  .card{background:#fff;border:1px solid #e6e8ec;border-radius:13px;padding:13px}
+  .cfg-row{display:flex;gap:8px;margin-top:9px;align-items:center}
+  .cfg-row:first-child{margin-top:0}
+  select,.inp{border:1px solid #dfe3e8;border-radius:9px;padding:9px 10px;font-size:13px;background:#fbfcfd;color:#333;outline:none;transition:border .15s,box-shadow .15s;min-width:0;font-family:inherit}
   select{flex:1}
-  .inp{flex:1;font-family:inherit}
-  .inp:focus{border-color:#2f6df6;box-shadow:0 0 0 3px rgba(47,109,246,.12);background:#fff}
-  textarea{width:100%;height:56px;border:1px solid #dfe3e8;border-radius:10px;padding:10px 12px;font-size:14px;font-family:inherit;background:#fbfcfd;resize:vertical;outline:none;transition:border .15s,box-shadow .15s}
+  .inp{flex:1}
+  .inp:focus,select:focus{border-color:#2f6df6;box-shadow:0 0 0 3px rgba(47,109,246,.12);background:#fff}
+  .hint{font-size:12px;color:#8a9098;line-height:1.55;margin-bottom:9px}
+  textarea{width:100%;height:60px;border:1px solid #dfe3e8;border-radius:10px;padding:10px 12px;font-size:14px;font-family:inherit;background:#fbfcfd;resize:vertical;outline:none;transition:border .15s,box-shadow .15s}
   textarea:focus{border-color:#2f6df6;box-shadow:0 0 0 3px rgba(47,109,246,.12);background:#fff}
-  button{background:#2f6df6;color:#fff;border:0;border-radius:10px;padding:10px 18px;font-size:14px;font-weight:700;cursor:pointer;transition:background .15s}
-  button:hover{background:#2559d6}
-  button:active{transform:translateY(1px)}
-  button.ghost{background:#eef1f5;color:#3a3f46;font-weight:600}
+  .actions{display:flex;gap:8px;margin-top:10px}
+  button.go{background:#2f6df6;color:#fff;border:0;border-radius:10px;padding:10px 20px;font-size:14px;font-weight:700;cursor:pointer;transition:background .15s}
+  button.go:hover{background:#2559d6}
+  button.go:active{transform:translateY(1px)}
+  button.ghost{background:#eef1f5;color:#3a3f46;font-weight:600;border:0;border-radius:10px;padding:10px 14px;font-size:13px;cursor:pointer;transition:.15s}
   button.ghost:hover{background:#e3e7ec}
-  .log{flex:1;min-height:130px;overflow:auto;background:#0e1116;color:#c9d4c9;font-family:Consolas,"Courier New",monospace;font-size:12px;line-height:1.75;padding:12px 14px;border-radius:12px;white-space:pre-wrap;word-break:break-all}
-  .ans{display:none;background:#f0f5ff;border:1px solid #d9e4ff;border-left:4px solid #2f6df6;border-radius:12px;padding:12px 14px}
-  .ans .t{font-size:11px;color:#5b7bd8;font-weight:700;margin-bottom:6px;letter-spacing:.5px}
-  .ans .c{font-size:14px;line-height:1.7;color:#1c2a4a}
+  button.ghost[hidden]{display:none}
+  /* 结果区 */
+  .result{flex:1;min-height:160px;display:flex;flex-direction:column;gap:8px}
+  .tabs{display:flex;gap:6px}
+  .tab{border:1px solid #e3e6ea;background:#fff;color:#6a7078;border-radius:9px;padding:6px 14px;font-size:12.5px;font-weight:600;cursor:pointer}
+  .tab.active{border-color:#2f6df6;color:#1f4fc0;background:#f5f8ff}
+  .panel{flex:1;min-height:0;display:flex}
+  .panel[hidden]{display:none}
+  .log{flex:1;overflow:auto;background:#0e1116;color:#c9d4c9;font-family:Consolas,"Courier New",monospace;font-size:12px;line-height:1.75;padding:12px 14px;border-radius:12px;white-space:pre-wrap;word-break:break-all}
+  .report{flex:1;overflow:auto;background:#fff;border:1px solid #e6e8ec;border-radius:12px;padding:16px 18px}
+  .rep-head{font-size:12px;color:#8a9098;margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid #eef0f3}
+  .sources{margin-bottom:14px;display:flex;flex-direction:column;gap:6px}
+  .src{font-size:12.5px;display:flex;gap:7px;align-items:flex-start;line-height:1.5}
+  .src .dot{width:6px;height:6px;border-radius:50%;background:#2f6df6;margin-top:6px;flex:none}
+  .src a{color:#2f6df6;text-decoration:none;word-break:break-all}
+  .src a:hover{text-decoration:underline}
+  .rep-body h2{font-size:17px;margin:6px 0 10px;color:#14181f}
+  .rep-body h3{font-size:14.5px;margin:16px 0 8px;color:#1f2530}
+  .rep-body h4{font-size:13.5px;margin:12px 0 6px;color:#2a313c}
+  .rep-body p{line-height:1.8;margin:8px 0;color:#2b313a}
+  .rep-body ul{margin:8px 0;padding-left:20px}
+  .rep-body li{line-height:1.8;margin:5px 0;color:#2b313a}
+  .rep-body a{color:#2f6df6;text-decoration:none}
+  .rep-body a:hover{text-decoration:underline}
+  .placeholder{color:#aab0b8;font-size:13px;line-height:1.7}
 </style></head><body><div class="wrap">
-<div class="top"><h1>AI 深度搜索 <em>·</em> 会自己上网查资料的助手</h1><div class="badge idle" id="st">○ Ready</div></div>
-<div class="sub">输入想查的问题或要办的事，它像真人一样打开浏览器去搜、去点、去打字发送，干完用一段话汇报。要<b>深度思考</b>：模型选 deepseek-reasoner 这类推理模型。key 只存本机。</div>
+<div class="top">
+  <div class="brand">AI 深度搜索助手 <em>会自己上网查、读、整理的助手</em></div>
+  <div class="status" id="st"><i></i><span>就绪</span></div>
+</div>
+
+<div class="modes">
+  <button class="mode active" data-mode="quick" onclick="setMode('quick')">⚡ 快速操作<small>去任意网页点按、打字、发送</small></button>
+  <button class="mode" data-mode="research" onclick="setMode('research')">🔬 深度研究<small>跨多网页读资料，给你一份带来源的报告</small></button>
+</div>
+
 <div class="card">
-  <div class="row">
+  <div class="cfg-row">
     <select id="prov" onchange="provChange()">
       <optgroup label="China">
         <option value="agnes">Agnes</option>
@@ -391,25 +600,33 @@ HTML = r"""<!doctype html><html lang="zh"><head><meta charset="utf-8">
       </optgroup>
     </select>
   </div>
-  <div class="row">
+  <div class="cfg-row">
     <input id="model" class="inp" list="mlist" placeholder="模型名">
     <datalist id="mlist"></datalist>
-    <input id="key" class="inp" placeholder="API Key（你自己的）">
+    <input id="key" class="inp" placeholder="API Key（仅存本机）">
   </div>
-  <div class="row" id="baserow" style="display:none">
+  <div class="cfg-row" id="baserow" style="display:none">
     <input id="base" class="inp" placeholder="Base URL，如 https://api.xx.com/v1">
   </div>
-  <textarea id="goal" placeholder="想查什么/要它干什么直接说，比如：帮我查下 2026 年最值得用的 AI Agent 工具，点开一篇细看 / 打开 http://localhost:4098 在输入框里发一句「你好」 / 查下今天天气"></textarea>
-  <div class="row">
-    <button onclick="start()">🔍 开始搜索</button>
+  <div class="hint" id="hint"></div>
+  <textarea id="goal" placeholder=""></textarea>
+  <div class="actions">
+    <button class="go" onclick="start()">🔍 开始</button>
     <button class="ghost" onclick="stop()">⏹ 停止</button>
+    <button class="ghost" id="openrep" onclick="openRep()" hidden>📂 打开报告</button>
   </div>
 </div>
-<div class="log" id="log"></div>
-<div class="ans" id="anscard"><div class="t">AGENT 的回答</div><div class="c" id="ans"></div></div>
+
+<div class="result">
+  <div class="tabs">
+    <button class="tab active" data-tab="log" onclick="setTab('log')">执行日志</button>
+    <button class="tab" data-tab="report" onclick="setTab('report')">研究报告</button>
+  </div>
+  <div class="panel" id="logpanel"><div class="log" id="log"></div></div>
+  <div class="panel" id="reportpanel" hidden><div class="report" id="report"><div class="placeholder">还没有报告。<br>切到「🔬 深度研究」模式，输入你的问题，开始一次任务后这里会显示带来源引用的研究报告。</div></div></div>
+</div>
 </div>
 <script>
-const DEFAULT_GOAL="去必应搜「2026 年最值得用的 AI Agent 工具」，点开第一篇看看讲什么";
 const PRESETS={
   agnes:{base:"https://apihub.agnes-ai.com/v1",models:["agnes-2.5-flash","agnes-2.5-pro"],needKey:true},
   siliconflow:{base:"https://api.siliconflow.cn/v1",models:["deepseek-ai/DeepSeek-V3","Qwen/Qwen2.5-72B-Instruct","THUDM/glm-4-9b-chat"],needKey:true},
@@ -437,12 +654,24 @@ const PRESETS={
   lmstudio:{base:"http://127.0.0.1:1234/v1",models:["local-model"],needKey:false},
   custom:{base:"",models:[],needKey:true}
 };
+const HINTS={
+  quick:"快速操作：让它打开某个网页去点、打字、发送。例如「打开 http://localhost:4098 在输入框发一句『你好』」「去B站搜猫片点第一个视频」。",
+  research:"深度研究：给它一个问题，它会跨多个网页读资料、抓正文，最后给你一份带来源引用的研究报告并存到本机。例如「2026 年最值得用的 AI Agent 工具有哪些？各有什么侧重」。"
+};
+const GOAL_PH={
+  quick:"想让它去哪个网页干什么，直接说：打开 http://localhost:4098 在输入框发「你好」 / 去B站搜猫片点第一个视频",
+  research:"想研究什么问题，直接说：2026 年最值得用的 AI Agent 工具有哪些？各自侧重是什么？"
+};
+let MODE="quick";
 let store={prov:"agnes",keys:{},models:{},base:""};
 try{ store=Object.assign(store, JSON.parse(localStorage.getItem('va_cfg')||'{}')); store.keys=store.keys||{}; store.models=store.models||{}; }catch(e){}
 function saveStore(){ try{ localStorage.setItem('va_cfg', JSON.stringify(store)); }catch(e){} }
 function appendLog(s){ var d=document.getElementById('log'); d.textContent += s+"\n"; d.scrollTop=d.scrollHeight; }
-function appendAnswer(s){ document.getElementById('ans').textContent=s; document.getElementById('anscard').style.display='block'; document.getElementById('anscard').scrollIntoView({behavior:'smooth',block:'nearest'}); }
-function setState(s){ var b=document.getElementById('st'); if(s==='running'){ b.className='badge run'; b.innerHTML='<i></i>搜索中'; } else { b.className='badge idle'; b.textContent='○ Ready'; } }
+function appendAnswer(s){ setTab('report'); var r=document.getElementById('report'); r.innerHTML='<div class="rep-head">一句话结论</div><div class="rep-body"><p style="font-size:14.5px;line-height:1.8">'+s+'</p></div>'; document.getElementById('openrep').hidden=true; }
+function appendReport(s){ setTab('report'); document.getElementById('report').innerHTML=s; document.getElementById('openrep').hidden=false; }
+function setState(s){ var b=document.getElementById('st'); if(s==='running'){ b.className='status run'; b.innerHTML='<i></i><span>搜索中</span>'; } else { b.className='status'; b.innerHTML='<i></i><span>就绪</span>'; } }
+function setMode(m){ MODE=m; document.querySelectorAll('.mode').forEach(function(x){ x.classList.toggle('active', x.dataset.mode===m); }); document.getElementById('hint').textContent=HINTS[m]; document.getElementById('goal').placeholder=GOAL_PH[m]; }
+function setTab(t){ document.querySelectorAll('.tab').forEach(function(x){ x.classList.toggle('active', x.dataset.tab===t); }); document.getElementById('logpanel').hidden=(t!=='log'); document.getElementById('reportpanel').hidden=(t!=='report'); }
 function provChange(){
   var v=document.getElementById('prov').value, p=PRESETS[v];
   var dl=document.getElementById('mlist'); dl.innerHTML='';
@@ -461,15 +690,17 @@ function start(){
   var base=(v==='custom')?document.getElementById('base').value.trim():p.base;
   if(p.needKey && !key){ alert('这个厂商需要填你自己的 API Key'); return; }
   if(v==='custom' && !base){ alert('自定义源需要填 Base URL'); return; }
+  if(!g){ alert('先说说你想查什么 / 要它干什么'); return; }
   store.prov=v; store.models[v]=model; store.keys[v]=key; if(v==='custom') store.base=base;
   saveStore();
   var cfg={base:base, model:model, key:key};
   document.getElementById('log').textContent='';
-  document.getElementById('anscard').style.display='none';
+  document.getElementById('report').innerHTML='<div class="placeholder">任务进行中…报告会在干完后出现在这里。</div>';
   setState('running');
-  window.pywebview.api.start(g||DEFAULT_GOAL, JSON.stringify(cfg));
+  window.pywebview.api.start(g, MODE, JSON.stringify(cfg));
 }
 function stop(){ window.pywebview.api.stop(); }
+function openRep(){ try{ window.pywebview.api.open_report_folder(); }catch(e){} }
 async function fillLocalKey(){
   try{
     var p=document.getElementById('prov').value;
@@ -482,7 +713,9 @@ async function fillLocalKey(){
 window.onload=function(){
   document.getElementById('prov').value=store.prov||'agnes';
   provChange();
-  fillLocalKey().then(function(){ start(); });
+  setMode('quick');
+  setTab('log');
+  fillLocalKey().then(function(){ /* 不自动开始，等用户点 */ });
 };
 </script></body></html>"""
 
@@ -491,7 +724,14 @@ class Api:
     def local_key(self):
         return local_key()
 
-    def start(self, goal, cfg_json):
+    def open_report_folder(self):
+        try:
+            os.makedirs(REPORT_DIR, exist_ok=True)
+            os.startfile(REPORT_DIR)
+        except Exception:
+            pass
+
+    def start(self, goal, mode, cfg_json):
         try:
             cfg = json.loads(cfg_json or "{}")
         except Exception:
@@ -503,10 +743,12 @@ class Api:
         if _busy.locked():
             log_q.put("⚠️ 已有任务在跑，先点「停止」或等它干完")
             return
+        mode = mode or "quick"
+
         def runner():
             with _busy:
                 try:
-                    run_agent(goal.strip(), cfg, "--headless" in sys.argv)
+                    run_agent(goal.strip(), cfg, "--headless" in sys.argv, mode)
                 finally:
                     log_q.put("STATE::idle")
         threading.Thread(target=runner, daemon=True).start()
@@ -522,6 +764,10 @@ def pump():
             try:
                 if line.startswith("ANSWER::"):
                     webview.windows[0].evaluate_js(f"appendAnswer({json.dumps(line[8:])})")
+                elif line.startswith("REPORT::"):
+                    webview.windows[0].evaluate_js(f"appendReport({json.dumps(line[7:])})")
+                elif line.startswith("OPENPATH::"):
+                    pass  # 路径仅日志，UI 用固定报告目录按钮
                 elif line.startswith("STATE::"):
                     webview.windows[0].evaluate_js(f"setState({json.dumps(line[7:])})")
                 else:
@@ -533,5 +779,5 @@ def pump():
 
 if __name__ == "__main__":
     threading.Thread(target=pump, daemon=True).start()
-    webview.create_window("AI 深度搜索助手", html=HTML, js_api=Api(), width=560, height=800)
+    webview.create_window("AI 深度搜索助手", html=HTML, js_api=Api(), width=580, height=820)
     webview.start(gui="edgechromium")
