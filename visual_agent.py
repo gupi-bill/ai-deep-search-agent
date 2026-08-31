@@ -9,6 +9,7 @@
 # 支持任意 OpenAI 兼容端点；推理模型（deepseek-reasoner 等）可直接当大脑。
 # 打包后双击即用。
 import os, json, re, sys, time, threading, queue, html, datetime
+from urllib.parse import quote
 import webview
 import requests
 from playwright.sync_api import sync_playwright
@@ -192,10 +193,12 @@ def agnes_research_report(goal, notes, cfg):
              "# 一句话结论\n"
              "用一两句话直接回答用户的问题。\n\n"
              "## 关键要点\n"
-             "用 - 列出 3-6 条要点，每条带一句依据。\n\n"
+             "用 - 列出 4-8 条要点，每条一句话说清观点 + 依据，"
+             "**并在句末用 [1] [2] 这样的编号标出依据来自哪个来源**（编号对应下面来源列表）。\n\n"
              "## 信息来源\n"
-             "逐条列出每个来源：`- [来源标题](链接) — 一句话说明它提供了什么`。\n\n"
-             "口语、自然、像真人整理。不要编造资料里没有的信息；资料不足就明说。只输出 Markdown，不要解释。")
+             "按编号逐条列出：`- [1] [来源标题](链接) — 一句话说明它提供了什么`。\n\n"
+             "口语、自然、像真人整理。不要编造资料里没有的信息；资料不足就明说。"
+             "只输出 Markdown，不要解释。")
     notes_txt = "\n\n".join(f"【来源 {i+1}】{n['title']}\n{n['url']}\n{n['text']}" for i, n in enumerate(notes))
     usr = f"用户的问题：{goal}\n\n抓取到的资料：\n{notes_txt}\n\n研究报告（Markdown）："
     try:
@@ -358,6 +361,159 @@ def close_last_browser():
             pass
 
 
+# ---------- 深度研究三件套：找得到 / 抓得下 / 提得准 ----------
+
+# 1) 从搜索结果页(SERP)批量抠出候选来源：标题 + 链接
+SERP_JS = """(lim) => {
+    const out=[], seen=new Set();
+    const badHost=/(^|\\.)(bing|baidu|google|so\\.com|sogou|duckduckgo|yandex|baidu\\.com|microsoft|msn|w3\\.org)\\./i;
+    const badPath=/\\/(search|login|signin|signup|register|404)(\\?|\\/|$)/i;
+    const sels=[
+        '#b_results li.b_algo h2 a',
+        '#b_results h2 a',
+        '#content_left .result h3 a',
+        '#content_left .t a',
+        '#search .g a h3',
+        'div.yuRUbf a',
+        '#rso a',
+        '.result a'
+    ];
+    let els=[];
+    for(const s of sels){
+        const r=document.querySelectorAll(s);
+        if(r && r.length>=2){ els=[...r]; break; }
+    }
+    if(!els.length){
+        els=[...document.querySelectorAll('a[href^="http"]')].filter(a=>{
+            const t=(a.innerText||'').trim();
+            return t.length>=8 && t.length<=120;
+        });
+    }
+    for(const a of els){
+        const u=(a.href||'').trim();
+        const t=(a.innerText||a.getAttribute('aria-label')||a.title||'').trim();
+        if(!u || !u.startsWith('http')) continue;
+        if(seen.has(u)) continue;
+        try{ if(badHost.test(new URL(u).hostname)) continue; }catch(e){ continue; }
+        if(badPath.test(u)) continue;
+        seen.add(u);
+        out.push({title:t||u, url:u});
+        if(out.length>=lim) break;
+    }
+    return out;
+}"""
+
+# 2) 正文提取：先砍掉导航/广告/页脚，再按"文字密度"挑出真正的正文容器
+ARTICLE_JS = """() => {
+    const kill='script,style,nav,header,footer,aside,form,iframe,noscript,svg,button,select,'+
+               '.ad,.ads,.advert,.advertisement,.sidebar,.comment,.comments,.nav,.menu,'+
+               '.breadcrumb,.pagination,.share,.related,.recommend,.footer,.header,.popup,.modal,'+
+               '[class*=advert],[id*=advert],[class*=sidebar],[class*=comment]';
+    try{ document.querySelectorAll(kill).forEach(e=>e.remove()); }catch(e){}
+    function score(el){
+        if(!el) return {el:null,den:-1,len:0,ps:0};
+        const ps=[...el.querySelectorAll('p')];
+        let plen=0; ps.forEach(p=>plen+=(p.innerText||'').trim().length);
+        let llen=0; el.querySelectorAll('a').forEach(a=>llen+=(a.innerText||'').trim().length);
+        // 链接文字要打折：全是链接的块多半是导航/推荐位，不是正文
+        return {el:el, den: plen - llen*0.5, len: plen, ps: ps.length};
+    }
+    const cands=[...document.querySelectorAll(
+        'article,main,[class*=content],[class*=article],[class*=post],[class*=detail],'+
+        '[id*=content],[id*=article],.post,.entry,.post-content,.article-content')];
+    let best=score(document.body);
+    for(const c of cands){ const s=score(c); if(s.den>best.den) best=s; }
+    const root=(best&&best.el)||document.body;
+    let txt='';
+    if(best && best.ps>=2){
+        txt=[...root.querySelectorAll('h1,h2,h3,p,li,pre,blockquote')]
+            .map(e=>(e.innerText||'').trim())
+            .filter(t=>t && t.length>0)
+            .join('\\n');
+    }
+    if(!txt || txt.length<200) txt=(document.body.innerText||'');
+    txt=txt.replace(/\\n{3,}/g,'\\n\\n').replace(/[ \\t]{2,}/g,' ').trim();
+    return txt.slice(0,12000);
+}"""
+
+
+def extract_article(page):
+    """抓当前页正文（去噪后的纯文本）。失败返回空串。"""
+    try:
+        return (_eval_to(page, ARTICLE_JS, timeout=12) or "").strip()
+    except Exception:
+        return ""
+
+
+def _shot(page, shots, tag):
+    """截图存档（最多 6 张）。"""
+    if len(shots) >= 6:
+        return
+    try:
+        os.makedirs(SHOT_DIR, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%H%M%S")
+        sp = os.path.join(SHOT_DIR, f"shot_{ts}_{tag}.png")
+        page.screenshot(path=sp, full_page=False)
+        shots.append(sp)
+    except Exception:
+        pass
+
+
+def deep_research(goal, cfg, page, shots, max_sources=8):
+    """深度研究快车道：搜索 → 结果页批量提取来源 → 逐个打开抓正文。
+
+    不走"逐点击决策"的慢循环（那玩意儿抓一个来源要点十几步、还容易点歪），
+    这里几秒一个来源，抓得多也抓得准。浏览器仍是可见的，你能看着它一页页翻。
+    """
+    notes = []
+    log_q.put(f"🔎 1/3 搜索｜去必应找「{goal[:30]}」…")
+    try:
+        page.goto("https://www.bing.com/search?q=" + quote(goal),
+                  wait_until="domcontentloaded", timeout=30000)
+        time.sleep(2)
+    except Exception as e:
+        log_q.put(f"⚠️ 搜索页打开失败：{e}")
+        return notes
+    _shot(page, shots, "serp")
+
+    links = _eval_to(page, SERP_JS, max_sources + 4, timeout=12) or []
+    links = [l for l in links if l.get("url")][:max_sources]
+    log_q.put(f"🔗 2/3 提取｜结果页抠出 {len(links)} 个候选来源")
+    if not links:
+        log_q.put("⚠️ 没抠到来源链接（可能是搜索页结构变了），退回普通模式")
+        return notes
+
+    for i, l in enumerate(links, 1):
+        if stop_ev.is_set():
+            log_q.put("⏹ 已停止")
+            break
+        title = (l.get("title") or l.get("url"))[:44]
+        log_q.put(f"📄 3/3 抓取｜{i}/{len(links)}：{title}")
+        try:
+            page.goto(l["url"], wait_until="domcontentloaded", timeout=25000)
+            time.sleep(1.5)
+        except Exception as e:
+            log_q.put(f"   ✗ 打不开：{str(e)[:60]}")
+            continue
+        if stop_ev.is_set():
+            break
+        txt = extract_article(page)
+        if txt and len(txt) > 200:
+            t = ""
+            try:
+                t = page.title()
+            except Exception:
+                pass
+            notes.append({"url": page.url, "title": t or l.get("title") or page.url, "text": txt})
+            log_q.put(f"   ✓ 抓到 {len(txt)} 字")
+            _shot(page, shots, f"s{i}")
+        else:
+            log_q.put("   ✗ 正文太少（可能是反爬/需登录），跳过")
+
+    log_q.put(f"📚 抓完：{len(notes)} 个有效来源，正在汇总成报告…")
+    return notes
+
+
 def run_agent(goal, cfg, headless, mode="quick"):
     history = []
     notes = []          # 深度研究：抓取的正文笔记
@@ -403,9 +559,15 @@ def run_agent(goal, cfg, headless, mode="quick"):
             time.sleep(1.5)
             log_q.put(f"🌐 已打开：{page.url}")
             log_q.put(f"🤖 大脑模型：{cfg.get('model')}  ｜  模式：{'🔬 深度研究' if research else '⚡ 快速操作'}")
-            log_q.put("🧠 正在把你的话翻译成执行计划…")
-            steps = plan_task(goal, cfg, research)
-            log_q.put("📋 计划 " + str(len(steps)) + " 步：" + " ｜ ".join(steps))
+            if research:
+                # 🔬 深度研究走快车道：搜索 → 结果页批量提取来源 → 逐个打开抓正文
+                #    （不走"逐点击决策"的慢循环，那玩意儿抓一个来源要点十几步还容易点歪）
+                notes = deep_research(goal, cfg, page, shots)
+                steps = []          # 空计划 = 直接跳过下面的 agent 决策循环
+            else:
+                log_q.put("🧠 正在把你的话翻译成执行计划…")
+                steps = plan_task(goal, cfg, research)
+                log_q.put("📋 计划 " + str(len(steps)) + " 步：" + " ｜ ".join(steps))
             si = 0
             stuck = 0
             last_sig = ""
@@ -415,7 +577,9 @@ def run_agent(goal, cfg, headless, mode="quick"):
                 if stop_ev.is_set():
                     log_q.put("⏹ 已停止"); break
                 if si >= len(steps):
-                    log_q.put("✅ 所有计划步骤完成。"); break
+                    if not research:
+                        log_q.put("✅ 所有计划步骤完成。")
+                    break
                 sub = steps[si]
                 els = grab_elements(page)
                 # 先给个"我在动"的信号，免得等模型那十几秒看着像死了
