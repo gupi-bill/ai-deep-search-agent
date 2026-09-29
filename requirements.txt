@@ -1,6 +1,27 @@
-# 运行依赖
+# ============================================
+# AI 深度搜索助手 · 运行依赖
+# Python 3.10+
+# ============================================
+
+# ---- 必需：浏览器自动化内核（两种模式都要）----
 playwright>=1.40
-pywebview>=5.0
 requests>=2.31
 
-# 打包（可选）：pip install pyinstaller
+# ---- 可选：图形窗口（只有 visual_agent.py 需要）----
+# 只跑 server.py（浏览器里用）就不需要它。
+# 装不上也不影响服务版：用 start-server.* 启动即可。
+pywebview>=5.0
+
+# ============================================
+# 首次使用还需要下载浏览器内核（只需一次）：
+#     python -m playwright install chromium
+# start.* 脚本会在检测到缺失时提示。
+# ============================================
+#
+# ---- 开发 / 测试（可选）----
+# pytest>=8.0
+# ruff>=0.5
+#
+# ---- 打包成 exe（可选）----
+# pip install pyinstaller
+# pyinstaller --onefile --windowed --name "AI深度搜索助手" visual_agent.py

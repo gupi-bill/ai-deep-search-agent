@@ -16,6 +16,41 @@
 
 ---
 
+## 🖥️ 平台支持
+
+| | Windows | macOS | Linux |
+|---|---------|-------|-------|
+| **图形窗口版**（`visual_agent.py`） | ✅ | ✅ | ⚠️ 需 `pip install pywebview` |
+| **本地服务版**（`server.py`，浏览器里用） | ✅ | ✅ | ✅ |
+
+**只需要 Python 3.10+**，不需要 Node、不需要 Docker、不需要编译。
+
+```bash
+git clone https://github.com/gupi-bill/ai-deep-search-agent.git
+cd ai-deep-search-agent
+
+./start.sh          # macOS / Linux
+# Windows 双击 start.bat
+```
+
+首次运行会自动建虚拟环境、装依赖。模型厂商的 key 在界面里填，**存在你本机**，不内置任何 key。
+
+<details>
+<summary>Linux 图形窗口版怎么装依赖？</summary>
+
+服务版开箱即用；图形窗口版需要 GTK/Qt：
+
+```bash
+sudo apt install python3-tk python3-gi gir1.2-gtk-3.0   # Debian / Ubuntu
+sudo dnf install python3-tkinter                       # Fedora
+pip install pywebview
+```
+
+装不上就用服务版，功能完全一样，只是界面在浏览器里。
+</details>
+
+---
+
 ## 目录
 
 - [🎯 两种模式](#-两种模式)
@@ -79,7 +114,14 @@ python visual_agent.py
 
 不依赖原生窗口、不依赖 PyInstaller：起一个本地 HTTP 服务，浏览器访问即可。
 
-**Windows 一键启动**：双击 `启动AI深度搜索助手.bat`（自动开浏览器，关掉黑窗口即停服务）。
+**一键启动**（首次运行会自动建虚拟环境、装依赖、开浏览器）：
+
+| 系统 | 图形窗口版 | 本地服务版（浏览器里用） |
+|------|-----------|----------------------|
+| **Windows** | 双击 `start.bat` | 双击 `start-server.bat` |
+| **macOS / Linux** | `./start.sh` | `./start-server.sh` |
+
+关掉那个终端窗口 = 服务停止。
 
 ```bash
 python server.py

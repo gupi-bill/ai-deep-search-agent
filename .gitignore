@@ -66,3 +66,13 @@ terraform.rc
 OpenClaw/
 .local_key_path
 va_cfg.json
+
+# ---- 本项目新增 ----
+.venv/
+venv/
+dist/
+build/
+*.spec
+key_store/
+.local_key_path
+va_cfg.json
