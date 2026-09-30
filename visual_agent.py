@@ -10,9 +10,22 @@
 # 打包后双击即用。
 import os, json, re, sys, time, threading, queue, html, datetime
 from urllib.parse import quote
-import webview
 import requests
-from playwright.sync_api import sync_playwright
+
+# webview / playwright 延迟到真正需要时再导入。
+# 原因：服务器、容器、CI 里没有 GUI 也没有浏览器内核，
+# 硬导入会让整个模块 import 失败 —— 连纯函数都用不了。
+# server.py（服务版）和 tests 都依赖这个模块能被裸导入。
+webview = None
+try:
+    import webview  # noqa: F811
+except Exception:  # ImportError, 或装了但缺 GTK/Qt 运行时
+    webview = None
+
+try:
+    from playwright.sync_api import sync_playwright
+except Exception:  # 没装 playwright，或浏览器内核没下载
+    sync_playwright = None
 
 
 log_q = queue.Queue()
@@ -52,7 +65,8 @@ def local_key():
     candidates.append(os.path.expanduser("~/.config/openclaw/openclaw.json"))
     for path in candidates:
         try:
-            cfg = json.load(open(path, encoding="utf-8"))
+            with open(path, encoding="utf-8") as f:
+                cfg = json.load(f)
             k = cfg.get("models", {}).get("providers", {}).get("agnes", {}).get("apiKey") or ""
             if k.strip():
                 return k.strip()
@@ -258,9 +272,20 @@ def _esc(t):
 
 def _inline(t):
     # 链接 [text](url)
-    t = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)",
-               lambda m: f'<a href="{m.group(2)}" target="_blank" rel="noopener">{_esc(m.group(1))}</a>', t)
-    return _esc(t)
+    # 关键：必须先转义原文，再把转义后的文字包进 <a>。
+    # 反过来做（先生成 <a> 再整体 _esc）的话，_esc 会把刚生成的标签
+    # 自己也转义掉，变成 &lt;a href=...&gt;，链接功能等于没有。
+    # 只认 http/https —— javascript: 这类不能变成可点链接。
+    out = []
+    pos = 0
+    for m in re.finditer(r"\[([^\]]+)\]\((https?://[^)]+)\)", t):
+        out.append(_esc(t[pos:m.start()]))                 # 链接前的普通文本
+        out.append(f'<a href="{m.group(2)}" target="_blank" rel="noopener">')
+        out.append(_esc(m.group(1)))                        # 链接文字
+        out.append("</a>")
+        pos = m.end()
+    out.append(_esc(t[pos:]))                               # 末尾剩下的
+    return "".join(out)
 
 
 def grab_elements(page):
@@ -536,6 +561,10 @@ def run_agent(goal, cfg, headless, mode="quick"):
         os.makedirs(SHOT_DIR, exist_ok=True)
     except Exception:
         pass
+    if sync_playwright is None:
+        return "没装 playwright，跑不起来。装一下：\n" \
+               "  pip install playwright\n" \
+               "  python -m playwright install chromium"
     try:
         with sync_playwright() as p:
             close_last_browser()
@@ -1034,6 +1063,24 @@ def pump():
 
 
 if __name__ == "__main__":
+    # 缺依赖时说清楚缺什么、怎么装，而不是抛一句 NoneType has no attribute
+    _missing = []
+    if webview is None:
+        _missing.append("pywebview（图形窗口）—— pip install pywebview")
+    if sync_playwright is None:
+        _missing.append("playwright（浏览器内核）—— pip install playwright "
+                        "&& python -m playwright install chromium")
+    if _missing:
+        print("=" * 60)
+        print("缺少依赖，跑不起来：")
+        for m in _missing:
+            print("  - " + m)
+        print()
+        print("如果只是想用，不想装图形窗口，可以改用服务版：")
+        print("  python server.py        # 然后浏览器打开 http://localhost:8080")
+        print("=" * 60)
+        raise SystemExit(1)
+
     threading.Thread(target=pump, daemon=True).start()
     webview.create_window("AI 深度搜索助手", html=HTML, js_api=Api(), width=580, height=820)
     webview.start(gui="edgechromium")
