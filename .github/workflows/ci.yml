@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    # 3.10 是项目声明的最低版本；3.13 是当前主力。
+    # 跨版本跑是为了抓到「在某个版本上才炸」的语法或 API 差异。
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # 只装 requests —— 够跑测试了。
+      # 故意不装 playwright / pywebview：这两个是软依赖，
+      # 测试必须在「没有它们」的环境下也能跑（这正是要守的东西）。
+      - name: 装最小依赖
+        run: python -m pip install -q requests
+
+      - name: 单元测试
+        run: python -m unittest tests.test_visual_agent -v
+
+      - name: 无 GUI 环境下必须能导入
+        run: |
+          python -c "import visual_agent; print('✓ 裸导入成功')"
+          python -c "import server; print('✓ server 裸导入成功')"
+
+      - name: 缺依赖时要给人话
+        run: |
+          set +e
+          out=$(python visual_agent.py 2>&1)
+          code=$?
+          set -e
+          # 期望非零退出，且提示里要说出缺什么、怎么装
+          if [ "$code" -eq 0 ]; then
+            echo "::error::缺依赖时应该非零退出"
+            exit 1
+          fi
+          echo "$out" | grep -qE 'playwright|pywebview' || {
+            echo "::error::缺依赖提示里没说清缺什么"; exit 1; }
+          echo "✓ 缺依赖提示清晰"
